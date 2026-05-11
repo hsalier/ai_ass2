@@ -9,7 +9,7 @@ from referee.game import PlayerColor, Coord, Direction, \
     Action, PlaceAction, MoveAction, EatAction, CascadeAction, BOARD_N
 
 
-
+DEPTH = 2
 Stack = tuple[PlayerColor, int]   # (colour, height)
 Board = dict[Coord, Stack | None]
 
@@ -51,27 +51,104 @@ class Agent:
         # Number of turns made by this agent only
         self._my_turns = 0
 
-    def action(self, **referee: dict) -> Action:
-        """
-        Called when it is this agent's turn.
-        For now, this returns simple hardcoded placement actions.
-        """
 
-        # Placement phase: each player places 4 stacks.
+    def _get_legal_actions(self, board: Board, color: PlayerColor) -> list[Action]:
+        
+
+            # Placement phase: if this colour has not placed 4 stacks yet,
+            # return all empty board cells as legal placement actions.
+            if self._placements_made[color] < 4:
+                return [
+                    PlaceAction(coord)
+                    for coord, stack in board.items()
+                    if stack is None
+                ]
+
+            eats = []
+            cascades = []
+            moves = []
+
+            enemy_color = (
+                PlayerColor.BLUE if color == PlayerColor.RED
+                else PlayerColor.RED
+            )
+
+            enemy_coords = {
+                coord
+                for coord, stack in board.items()
+                if stack is not None and stack[0] == enemy_color
+            }
+
+            for coord, stack in board.items():
+                if stack is None:
+                    continue
+
+                stack_color, stack_height = stack
+
+                # Only generate actions for this player's own stacks.
+                if stack_color != color:
+                    continue
+
+                for direction in Direction:
+                    dest_r = coord.r + direction.r
+                    dest_c = coord.c + direction.c
+
+                    # Check bounds before constructing Coord.
+                    if not (0 <= dest_r < BOARD_N and 0 <= dest_c < BOARD_N):
+                        continue
+
+                    dest = Coord(dest_r, dest_c)
+                    dest_stack = board[dest]
+
+                    # EAT: destination has enemy stack and attacker is tall enough.
+                    if dest_stack is not None:
+                        dest_color, dest_height = dest_stack
+
+                        if dest_color == enemy_color and stack_height >= dest_height:
+                            eats.append(EatAction(coord, direction))
+
+                    # MOVE: destination is empty or has friendly stack.
+                    if dest_stack is None or dest_stack[0] == color:
+                        moves.append(MoveAction(coord, direction))
+
+                    # CASCADE: stack height must be at least 2.
+                    if stack_height >= 2:
+                        cascades.append(CascadeAction(coord, direction))
+
+            return eats + cascades + moves
+    
+   
+    def action(self, **referee: dict) -> Action:
+        # Placement phase
         if self._placements_made[self._color] < 4:
             i = self._placements_made[self._color]
-
             if self._color == PlayerColor.RED:
                 return PlaceAction(Coord(0, i))
             else:
                 return PlaceAction(Coord(7, i))
 
-        # Temporary play-phase fallback.
-        # This is not strategically correct yet and may become invalid later.
-        if self._color == PlayerColor.RED:
-            return CascadeAction(Coord(0, 3), Direction.Left)
-        else:
-            return MoveAction(Coord(7, 0), Direction.Up)
+        # Minimax decision: try every action, pick the one with highest minimax value
+        best_action = None
+        best_value = float('-inf')
+
+        legal = self._get_legal_actions(self._board, self._color)        
+        if not legal:
+            return best_action
+
+        for act in legal:
+            new_board = self._apply_action(self._board, self._color, act)
+            value = self._minimax_value(
+                board=new_board,
+                color=self._opponent,
+                depth=DEPTH - 1,
+                alpha=float('-inf'),
+                beta=float('inf')
+            )
+            if value > best_value:
+                best_value = value
+                best_action = act
+
+        return best_action
 
     def update(self, color: PlayerColor, action: Action, **referee: dict):
         """
@@ -89,16 +166,12 @@ class Agent:
         if isinstance(action, PlaceAction):
             self._placements_made[color] += 1
 
-
     def _apply_action(
         self,
         board: Board,
         color: PlayerColor,
         action: Action
     ) -> Board:
-        """
-        Applies a valid action to a copied board and returns the new board.
-        """
 
         new_board = dict(board)
 
@@ -118,18 +191,13 @@ class Agent:
                 else:
                     source_color, source_height = source
                     dest_color, dest_height = dest_stack
-
-                    new_board[dest] = (
-                        source_color,
-                        source_height + dest_height
-                    )
+                    new_board[dest] = (source_color, source_height + dest_height)
 
             case EatAction(coord, direction):
                 source = new_board[coord]
                 new_board[coord] = None
 
                 dest = coord + direction
-
                 source_color, source_height = source
                 new_board[dest] = (source_color, source_height)
 
@@ -140,13 +208,13 @@ class Agent:
                 source_color, source_height = source
 
                 for i in range(1, source_height + 1):
-                    pos = Coord(
-                        coord.r + direction.r * i,
-                        coord.c + direction.c * i
-                    )
+                    pos_r = coord.r + direction.r * i
+                    pos_c = coord.c + direction.c * i
 
-                    if not self._in_bounds(pos):
+                    if not (0 <= pos_r < BOARD_N and 0 <= pos_c < BOARD_N):
                         break
+
+                    pos = Coord(pos_r, pos_c)
 
                     if new_board[pos] is not None:
                         self._push(new_board, pos, direction)
@@ -159,20 +227,19 @@ class Agent:
         return new_board
 
 
+
     def _push(self, board: Board, coord: Coord, direction: Direction):
-        """
-        Pushes one stack in the given direction.
-        Removes it if pushed off the board.
-        """
+    
 
-        dest = Coord(
-            coord.r + direction.r,
-            coord.c + direction.c
-        )
+        dest_r = coord.r + direction.r
+        dest_c = coord.c + direction.c
 
-        if not self._in_bounds(dest):
+        # Important: check bounds BEFORE constructing Coord.
+        if not (0 <= dest_r < BOARD_N and 0 <= dest_c < BOARD_N):
             board[coord] = None
             return
+
+        dest = Coord(dest_r, dest_c)
 
         if board[dest] is not None:
             self._push(board, dest, direction)
@@ -180,6 +247,8 @@ class Agent:
         board[dest] = board[coord]
         board[coord] = None
 
-
-    def _in_bounds(self, coord: Coord) -> bool:
-        return 0 <= coord.r < BOARD_N and 0 <= coord.c < BOARD_N
+        def _in_bounds(self, coord: Coord) -> bool:
+            return 0 <= coord.r < BOARD_N and 0 <= coord.c < BOARD_N
+        
+    
+    
