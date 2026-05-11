@@ -3,9 +3,9 @@
 
 from referee.game import PlayerColor, Coord, Direction, \
     Action, PlaceAction, MoveAction, EatAction, CascadeAction, BOARD_N
+import random
 
-
-DEPTH = 2
+DEPTH = 4
 CARDINAL_DIRECTIONS = [
     Direction.Up,
     Direction.Down,
@@ -46,26 +46,38 @@ class Agent:
             PlayerColor.BLUE: 0,
         }
 
+        self._position_history: list[int] = []
+
+    def _board_hash(self, board: Board) -> int:
+        return hash(frozenset(
+            (coord, stack)
+            for coord, stack in board.items()
+            if stack is not None
+        ))
+
     def action(self, **referee: dict) -> Action:
         """
         Called when it is this agent's turn.
         Chooses an action to return to the referee.
         """
 
-        # Hardcoded placement phase for now.
+        # Placement phase (rn its just random)
         if self._placements_made[self._color] < 4:
-            i = self._placements_made[self._color]
-
-            if self._color == PlayerColor.RED:
-                return PlaceAction(Coord(0, i))
-            else:
-                return PlaceAction(Coord(7, i))
+            legal = self._get_legal_actions(self._board, self._color)
+            return random.choice(legal)
 
         # Play phase: use minimax to choose the best action.
         legal = self._get_legal_actions(self._board, self._color)
+        random.shuffle(legal)
 
-        if not legal:
-            raise ValueError("No legal actions available")
+        safe = [
+            act for act in legal
+            if self._position_history.count(
+                self._board_hash(self._apply_action(self._board, self._color, act))
+            ) < 2
+        ]
+
+        legal = safe if safe else legal
 
         best_action = legal[0]
         best_value = float("-inf")
@@ -102,6 +114,8 @@ class Agent:
 
         if isinstance(action, PlaceAction):
             self._placements_made[color] += 1
+        
+        self._position_history.append(self._board_hash(self._board))
 
     def _get_legal_actions(self, board: Board, color: PlayerColor) -> list[Action]:
         """
@@ -111,10 +125,23 @@ class Agent:
         # Placement phase: if this colour has placed fewer than 4 stacks,
         # all empty squares are legal placement actions.
         if self._placements_made[color] < 4:
+            total_placed = self._placements_made[PlayerColor.RED] + self._placements_made[PlayerColor.BLUE]
+            opponent = self._enemy(color)
+
+            def is_adjacent_to_opponent(coord):
+                for direction in CARDINAL_DIRECTIONS:
+                    nr, nc = coord.r + direction.r, coord.c + direction.c
+                    if 0 <= nr < BOARD_N and 0 <= nc < BOARD_N:
+                        neighbor = board[Coord(nr, nc)]
+                        if neighbor is not None and neighbor[0] == opponent:
+                            return True
+                return False
+
             return [
                 PlaceAction(coord)
                 for coord, stack in board.items()
                 if stack is None
+                and (total_placed == 0 or not is_adjacent_to_opponent(coord))
             ]
 
         eats = []
@@ -280,9 +307,7 @@ class Agent:
             return self._evaluation_function(board)
 
         legal = self._get_legal_actions(board, color)
-
-        if not legal:
-            return self._evaluation_function(board)
+        random.shuffle(legal)
 
         if color == self._color:
             # MAX node: our turn.
@@ -336,35 +361,82 @@ class Agent:
 
     def _evaluation_function(self, board: Board) -> float:
         """
-        Basic heuristic evaluation from this agent's perspective.
+        Heuristic evaluation from this agent's perspective.
+        Positive = good for us, negative = good for opponent.
 
-        Positive = good for us.
-        Negative = good for opponent.
+        Components (in order of weight):
+        1. Token differential  — primary signal
+        2. Aggression          — reward proximity/threat to opponent
+        3. Height optimality   — penalise stacks outside ideal range [3, 6]
+        4. Centrality          — reward central position, especially h>=4 in centre 4
         """
 
-        our_total_height = 0
-        opponent_total_height = 0
+        CENTRE_4 = {Coord(3, 3), Coord(3, 4), Coord(4, 3), Coord(4, 4)}
 
-        our_stack_count = 0
-        opponent_stack_count = 0
+        our_tokens      = 0
+        opp_tokens      = 0
+        height_score    = 0.0
+        centrality_score = 0.0
 
-        for stack in board.values():
+        our_coords = []
+        opp_coords = []
+
+        for coord, stack in board.items():
             if stack is None:
                 continue
 
             color, height = stack
+            is_ours = (color == self._color)
+            sign = 1 if is_ours else -1
 
-            if color == self._color:
-                our_total_height += height
-                our_stack_count += 1
+            # --- Token count ---
+            if is_ours:
+                our_tokens += height
+                our_coords.append(coord)
             else:
-                opponent_total_height += height
-                opponent_stack_count += 1
+                opp_tokens += height
+                opp_coords.append(coord)
 
-        height_score = our_total_height - opponent_total_height
-        stack_score = our_stack_count - opponent_stack_count
+            # --- Height optimality ---
+            # Ideal range is [3, 6]. Penalise stacks outside it.
+            # Sign flips for opponent: we benefit if they have bad heights.
+            if height < 4:
+                height_score += sign * (height - 3)   # e.g. h=1 → -2, h=2 → -1
+            elif height >= 4:
+                height_score += sign * (7 - height)   # e.g. h=7 → -1, h=8 → -2
 
-        return height_score + 0.5 * stack_score
+            # --- Centrality ---
+            # Manhattan distance from board centre (3.5, 3.5); max possible = 7.
+            dist = abs(coord.r - 3.5) + abs(coord.c - 3.5)
+            base_centrality = (7.0 - dist) / 7.0   # 0 at corner, ~1 near centre
+
+            # Special bonus: h>=4 in centre 4 squares dominates any row/col
+            if coord in CENTRE_4 and height >= 4:
+                centrality_score += sign * 2.0
+            else:
+                centrality_score += sign * base_centrality
+
+        # --- Aggression ---
+        # For each of our stacks, reward being close to the nearest opponent.
+        # Max Manhattan distance on an 8x8 board is 14; we normalise to [0, 1].
+        aggression_score = 0.0
+        if our_coords and opp_coords:
+            for our_c in our_coords:
+                min_dist = min(
+                    abs(our_c.r - opp_c.r) + abs(our_c.c - opp_c.c)
+                    for opp_c in opp_coords
+                )
+                aggression_score += (14.0 - min_dist) / 14.0
+
+        # --- Weighted sum ---
+        token_diff = our_tokens - opp_tokens
+
+        return (
+            10.0 * token_diff       +   # primary: raw material advantage
+            1.0 * aggression_score +   # secondary: stay threatening
+            2.0 * height_score     +   # tertiary: stack health
+            1.5 * centrality_score     # quaternary: board position
+        )
 
     def _check_loss(self, board: Board, color: PlayerColor) -> bool:
         """
