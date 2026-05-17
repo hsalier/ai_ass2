@@ -48,27 +48,160 @@ class Agent:
 
         self._position_history: list[int] = []
 
+         
+     
+
+
     def _board_hash(self, board: Board) -> int:
         return hash(frozenset(
             (coord, stack)
             for coord, stack in board.items()
             if stack is not None
         ))
+    
 
+    def _can_enemy_cascade_to(self, coord: Coord) -> bool:
+        """
+        Returns True if the opponent has a stack that could immediately cascade
+        onto this coordinate.
+
+        A cascade can affect squares in the same row or column up to the
+        cascading stack's height.
+        """
+
+        enemy = self._opponent
+
+        for enemy_coord, stack in self._board.items():
+            if stack is None:
+                continue
+
+            stack_color, stack_height = stack
+
+            if stack_color != enemy:
+                continue
+
+            # Enemy stack must have height at least 2 to cascade.
+            if stack_height < 2:
+                continue
+
+            same_row = enemy_coord.r == coord.r
+            same_col = enemy_coord.c == coord.c
+
+            if not same_row and not same_col:
+                continue
+
+            distance = abs(enemy_coord.r - coord.r) + abs(enemy_coord.c - coord.c)
+
+            # If coord is within cascade range, enemy can immediately affect it.
+            if 1 <= distance <= stack_height:
+                return True
+
+        return False
+
+    # Function for strategic placing
+    def _choose_placement_action(self, legal: list[Action]) -> Action:
+        """
+        Chooses a placement action using a simple rule-based strategy.
+
+        Strategy:
+        - Avoid corners.
+        - Avoid edges where possible.
+        - Avoid squares that can be immediately cascaded by the opponent.
+        - Prefer central, mobile squares.
+        - Friendly adjacency is allowed.
+        """
+
+        placement_actions = [
+            act for act in legal
+            if isinstance(act, PlaceAction)
+        ]
+
+        if not placement_actions:
+            return self._choose_placement_action(legal)
+
+        scored_actions = []
+
+        for act in placement_actions:
+            coord = act.coord
+            score = 0.0
+
+            # ============================================================
+            # DO NOT DO rules / penalties
+            # ============================================================
+
+            # Avoid corners strongly
+            if (coord.r, coord.c) in {
+                (0, 0), (0, BOARD_N - 1),
+                (BOARD_N - 1, 0), (BOARD_N - 1, BOARD_N - 1)
+            }:
+                score -= 100
+
+            # Avoid edges unless necessary
+            if (
+                coord.r == 0 or coord.r == BOARD_N - 1
+                or coord.c == 0 or coord.c == BOARD_N - 1
+            ):
+                score -= 20
+
+            # Avoid placing somewhere the opponent can immediately cascade onto
+            if self._can_enemy_cascade_to(coord):
+                score -= 80
+
+            # ============================================================
+            # Rough positive guidelines
+            # ============================================================
+
+            # Prefer central-ish squares
+            centre_r = (BOARD_N - 1) / 2
+            centre_c = (BOARD_N - 1) / 2
+            dist_from_centre = abs(coord.r - centre_r) + abs(coord.c - centre_c)
+
+            score += 10 * (BOARD_N - dist_from_centre)
+
+            # Prefer mobility: number of empty neighbouring squares
+            mobility = 0
+
+            for direction in CARDINAL_DIRECTIONS:
+                nr = coord.r + direction.r
+                nc = coord.c + direction.c
+
+                if 0 <= nr < BOARD_N and 0 <= nc < BOARD_N:
+                    neighbour = self._board[Coord(nr, nc)]
+
+                    if neighbour is None:
+                        mobility += 1
+
+            score += 5 * mobility
+
+            scored_actions.append((score, act))
+
+        scored_actions.sort(key=lambda item: item[0], reverse=True)
+
+        return scored_actions[0][1]
+    
+    
+    
+    
+    
     def action(self, **referee: dict) -> Action:
         """
         Called when it is this agent's turn.
         Chooses an action to return to the referee.
         """
 
-        # Placement phase (rn its just random)
         if self._placements_made[self._color] < 4:
             legal = self._get_legal_actions(self._board, self._color)
-            return random.choice(legal)
+            return self._choose_placement_action(legal)
 
         # Play phase: use minimax to choose the best action.
         legal = self._get_legal_actions(self._board, self._color)
         random.shuffle(legal)
+
+        #override the winning, check if it works
+        for act in legal:
+            new_board = self._apply_action(self._board, self._color, act)
+            if self._check_loss(new_board, self._opponent):
+                return act
 
         safe = [
             act for act in legal
@@ -85,10 +218,12 @@ class Agent:
         for act in legal:
             new_board = self._apply_action(self._board, self._color, act)
 
+            search_depth = self._choose_search_depth(self._board, referee)
+
             value = self._minimax_value(
                 board=new_board,
                 color=self._opponent,
-                depth=DEPTH - 1,
+                depth=search_depth - 1,
                 alpha=float("-inf"),
                 beta=float("inf")
             )
@@ -464,3 +599,70 @@ class Agent:
         """
 
         return 0 <= coord.r < BOARD_N and 0 <= coord.c < BOARD_N
+        
+    def _choose_search_depth(self, board: Board, referee: dict) -> int:
+        """
+        Chooses minimax depth based on remaining time and board complexity.
+
+        Main rule:
+        - If the referee says there are 2 minutes 30 seconds or less remaining,
+        force depth down to 4.
+
+        Otherwise:
+        - Use deeper search when the board is simpler.
+        - Use shallower search when the board has many legal actions/stacks.
+        """
+
+        # ------------------------------------------------------------
+        # Time-based depth control
+        # ------------------------------------------------------------
+        # The referee dictionary may contain remaining time under different
+        # possible names depending on the project scaffold.
+        #
+        # Common possibilities:
+        # - "time_remaining"
+        # - "remaining_time"
+        # - "time"
+        #
+        # This code safely checks all of them.
+        remaining_time = (
+            referee.get("time_remaining")
+            or referee.get("remaining_time")
+            or referee.get("time")
+        )
+
+        # 2 minutes 30 seconds = 150 seconds
+        if remaining_time is not None and remaining_time <= 150:
+            return 4
+
+        # ------------------------------------------------------------
+        # Board-complexity depth control
+        # ------------------------------------------------------------
+        legal_count = len(self._get_legal_actions(board, self._color))
+
+        stack_count = sum(
+            1 for stack in board.values()
+            if stack is not None
+        )
+
+        total_tokens = sum(
+            height
+            for stack in board.values()
+            if stack is not None
+            for _, height in [stack]
+        )
+
+        # Very complex board: many options, so search less deeply.
+        if legal_count >= 35 or stack_count >= 18 or total_tokens >= 45:
+            return 5
+
+        # Medium-complexity board.
+        if legal_count >= 20 or stack_count >= 12 or total_tokens >= 30:
+            return 5
+
+        # Simpler board.
+        if legal_count >= 10 or stack_count >= 7:
+            return 5
+
+        # Endgame / very few stacks.
+        return 6
