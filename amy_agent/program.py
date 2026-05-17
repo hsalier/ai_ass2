@@ -197,11 +197,19 @@ class Agent:
         legal = self._get_legal_actions(self._board, self._color)
         random.shuffle(legal)
 
-        #override the winning, check if it works
+        # 1. If we can immediately win, always do it.
         for act in legal:
             new_board = self._apply_action(self._board, self._color, act)
             if self._check_loss(new_board, self._opponent):
                 return act
+
+        # 2. Simple boxed-endgame override.
+        # If Blue has one stack left and is already boxed by one of our Red stacks,
+        # use that Red stack to keep shrinking the box.
+        boxed_endgame_action = self._boxed_endgame_action(legal)
+
+        if boxed_endgame_action is not None:
+            return boxed_endgame_action
 
         safe = [
             act for act in legal
@@ -619,31 +627,19 @@ class Agent:
         # The referee dictionary may contain remaining time under different
         # possible names depending on the project scaffold.
         #
-        # Common possibilities:
-        # - "time_remaining"
-        # - "remaining_time"
-        # - "time"
-        #
-        # This code safely checks all of them.
-        remaining_time = (
-            referee.get("time_remaining")
-            or referee.get("remaining_time")
-            or referee.get("time")
-        )
+        remaining_time = referee["time_remaining"]
 
-        # 2 minutes 30 seconds = 150 seconds
-        if remaining_time is not None and remaining_time <= 150:
+        if remaining_time is not None and remaining_time <= 45:
             return 4
+        elif remaining_time is not None and remaining_time <= 15:
+            return 3
+        elif remaining_time is not None and remaining_time <= 5:
+            return 2
+        
 
         # ------------------------------------------------------------
         # Board-complexity depth control
         # ------------------------------------------------------------
-        legal_count = len(self._get_legal_actions(board, self._color))
-
-        stack_count = sum(
-            1 for stack in board.values()
-            if stack is not None
-        )
 
         total_tokens = sum(
             height
@@ -653,16 +649,311 @@ class Agent:
         )
 
         # Very complex board: many options, so search less deeply.
-        if legal_count >= 35 or stack_count >= 18 or total_tokens >= 45:
+        if total_tokens > 10:
             return 5
 
         # Medium-complexity board.
-        if legal_count >= 20 or stack_count >= 12 or total_tokens >= 30:
-            return 5
-
-        # Simpler board.
-        if legal_count >= 10 or stack_count >= 7:
-            return 5
+        elif 6 <= total_tokens <= 10:
+            return 6
 
         # Endgame / very few stacks.
         return 6
+    
+    def _boxed_endgame_action(self, legal: list[Action]) -> Action | None:
+        """
+        Simple hardcoded endgame strategy.
+
+        Activates only when:
+        - Opponent has exactly one stack.
+        - We have total token count >= 7.
+        - One of our stacks is already boxing the opponent into a smaller grid.
+
+        Once activated:
+        - If we can immediately win, win.
+        - Otherwise, move the boxing stack inward to shrink the box.
+        - If no safe boxed move exists, fall back to minimax.
+        """
+
+        enemy_stacks = self._get_stacks_of_color(self._board, self._opponent)
+        our_total_tokens = self._total_tokens(self._board, self._color)
+
+        # Only use this endgame rule in the specific winning-material case.
+        if len(enemy_stacks) != 1:
+            return None
+
+        if our_total_tokens < 7:
+            return None
+
+        enemy_coord, enemy_height = enemy_stacks[0]
+
+        # If we can win immediately, do it.
+        immediate_win = self._find_immediate_win(self._board, self._color, legal)
+
+        if immediate_win is not None:
+            return immediate_win
+
+        # Find a Red stack that is already boxing Blue.
+        boxed_info = self._boxed_guard(enemy_coord)
+
+        if boxed_info is None:
+            return None
+
+        guard_coord, guard_height = boxed_info
+
+        candidates = []
+
+        for act in legal:
+            # For the simplified strategy, only move the boxing Red stack.
+            if not isinstance(act, MoveAction):
+                continue
+
+            if act.coord != guard_coord:
+                continue
+
+            new_board = self._apply_action(self._board, self._color, act)
+
+            # Do not choose a move that lets Blue immediately win.
+            if self._opponent_has_immediate_win(new_board):
+                continue
+
+            # After the move, Blue must still be boxed by the moved guard stack.
+            new_guard_coord = guard_coord + act.direction
+
+            if not self._in_bounds(new_guard_coord):
+                continue
+
+            new_guard_stack = new_board[new_guard_coord]
+
+            if new_guard_stack is None:
+                continue
+
+            new_guard_color, new_guard_height = new_guard_stack
+
+            if new_guard_color != self._color:
+                continue
+
+            # Blue should still be boxed after this move.
+            if not self._is_boxed_by_guard(
+                blue_coord=enemy_coord,
+                guard_coord=new_guard_coord,
+                guard_height=new_guard_height
+            ):
+                continue
+
+            old_box_area = self._box_area(enemy_coord, guard_coord)
+            new_box_area = self._box_area(enemy_coord, new_guard_coord)
+
+            # We want moves that shrink Blue's available box.
+            shrink_amount = old_box_area - new_box_area
+
+            if shrink_amount <= 0:
+                continue
+
+            # Prefer:
+            # - shrinking the box more
+            # - keeping / making the guard taller
+            # - staying reasonably central, so the guard can still cascade well
+            centre_dist = abs(new_guard_coord.r - 3.5) + abs(new_guard_coord.c - 3.5)
+
+            score = (
+                100.0 * shrink_amount
+                + 5.0 * new_guard_height
+                - 2.0 * centre_dist
+            )
+
+            candidates.append((score, act))
+
+        if not candidates:
+            return None
+
+        candidates.sort(key=lambda item: item[0], reverse=True)
+
+        return candidates[0][1]
+    
+    def _get_stacks_of_color(
+        self,
+        board: Board,
+        color: PlayerColor
+    ) -> list[tuple[Coord, int]]:
+        """
+        Returns all stacks belonging to a given color as (coord, height).
+        """
+
+        stacks = []
+
+        for coord, stack in board.items():
+            if stack is None:
+                continue
+
+            stack_color, stack_height = stack
+
+            if stack_color == color:
+                stacks.append((coord, stack_height))
+
+        return stacks
+
+
+    def _total_tokens(self, board: Board, color: PlayerColor) -> int:
+        """
+        Returns the total token count for one player.
+        Example: R3 + R4 = 7 tokens.
+        """
+
+        total = 0
+
+        for stack in board.values():
+            if stack is None:
+                continue
+
+            stack_color, stack_height = stack
+
+            if stack_color == color:
+                total += stack_height
+
+        return total
+
+
+    def _find_immediate_win(
+        self,
+        board: Board,
+        color: PlayerColor,
+        legal: list[Action] | None = None
+    ) -> Action | None:
+        """
+        Returns an action that immediately removes the opponent's last stack.
+        """
+
+        opponent = self._enemy(color)
+
+        if legal is None:
+            legal = self._get_legal_actions(board, color)
+
+        for act in legal:
+            new_board = self._apply_action(board, color, act)
+
+            if self._check_loss(new_board, opponent):
+                return act
+
+        return None
+
+
+    def _opponent_has_immediate_win(self, board: Board) -> bool:
+        """
+        Returns True if the opponent can immediately win from this board.
+        This prevents our hardcoded strategy from walking into obvious losses.
+        """
+
+        opponent_legal = self._get_legal_actions(board, self._opponent)
+
+        for act in opponent_legal:
+            new_board = self._apply_action(board, self._opponent, act)
+
+            if self._check_loss(new_board, self._color):
+                return True
+
+        return False
+    
+    def _boxed_guard(self, blue_coord: Coord) -> tuple[Coord, int] | None:
+        """
+        Finds one of our Red stacks that is already boxing Blue into a smaller grid.
+
+        A Red stack boxes Blue if:
+        - The Red stack is not on the outer edge.
+        - Blue is not on the same row or column as the Red stack.
+        - The Red stack's row and column form internal boundaries.
+        - Blue is therefore trapped inside one of the four smaller rectangles
+        formed by the Red stack's row and column.
+
+        This is intentionally simple and conservative.
+        """
+
+        candidates = []
+
+        for red_coord, red_height in self._get_stacks_of_color(self._board, self._color):
+
+            if self._is_boxed_by_guard(
+                blue_coord=blue_coord,
+                guard_coord=red_coord,
+                guard_height=red_height
+            ):
+                area = self._box_area(blue_coord, red_coord)
+
+                centre_dist = abs(red_coord.r - 3.5) + abs(red_coord.c - 3.5)
+
+                score = (
+                    -10.0 * area
+                    + 5.0 * red_height
+                    - 2.0 * centre_dist
+                )
+
+                candidates.append((score, red_coord, red_height))
+
+        if not candidates:
+            return None
+
+        candidates.sort(key=lambda item: item[0], reverse=True)
+
+        _, best_coord, best_height = candidates[0]
+
+        return best_coord, best_height
+
+
+    def _is_boxed_by_guard(
+        self,
+        blue_coord: Coord,
+        guard_coord: Coord,
+        guard_height: int
+    ) -> bool:
+        """
+        Returns True if guard_coord acts like an internal row/column wall
+        that boxes Blue into a smaller region of the board.
+
+        The guard does not need to be R5 here, because this helper is only
+        detecting an already-good boxed position. The actual action choice
+        still checks that the box remains valid after moving.
+        """
+
+        # A stack of height 1 cannot cascade, so it is not a real wall.
+        if guard_height < 2:
+            return False
+
+        # The guard's row and column need to be internal boundaries.
+        # If it is on the edge, it does not create a smaller box.
+        if guard_coord.r == 0 or guard_coord.r == BOARD_N - 1:
+            return False
+
+        if guard_coord.c == 0 or guard_coord.c == BOARD_N - 1:
+            return False
+
+        # If Blue is on the same row/column already, then this is not a box;
+        # it is either an immediate tactical position or a danger line.
+        if blue_coord.r == guard_coord.r:
+            return False
+
+        if blue_coord.c == guard_coord.c:
+            return False
+
+        return True
+
+
+    def _box_area(self, blue_coord: Coord, guard_coord: Coord) -> int:
+        """
+        Calculates the area of the smaller rectangle that Blue is trapped in,
+        using the guard's row and column as internal walls.
+
+        Example:
+        If guard is at (4, 4) and Blue is in the top-left region,
+        then Blue's box is rows 0..3 and cols 0..3, area 16.
+        """
+
+        if blue_coord.r < guard_coord.r:
+            row_size = guard_coord.r
+        else:
+            row_size = BOARD_N - guard_coord.r - 1
+
+        if blue_coord.c < guard_coord.c:
+            col_size = guard_coord.c
+        else:
+            col_size = BOARD_N - guard_coord.c - 1
+
+        return row_size * col_size
